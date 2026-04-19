@@ -6,7 +6,8 @@ import base64
 import datetime
 from functools import wraps
 
-import psycopg
+import psycopg2
+import psycopg2.extras
 import anthropic
 import openpyxl
 import requests
@@ -30,7 +31,6 @@ GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_SECRET    = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 APP_URL          = os.environ.get("APP_URL", "http://localhost:5000").rstrip("/")
 
-# Normalize postgres:// -> postgresql:// (Railway sometimes gives the old scheme)
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
@@ -46,40 +46,41 @@ CATEGORIES = {
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_KEY) if ANTHROPIC_KEY else None
 
 # ---------------------------------------------------------------------------
-# Database helpers (psycopg 3, uses %s placeholders)
+# Database helpers (psycopg2, uses %s placeholders)
 # ---------------------------------------------------------------------------
 def db_connect():
-    return psycopg.connect(DATABASE_URL, sslmode="require")
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 
 def db_exec(sql, params=()):
-    """Execute a statement with no return (INSERT/UPDATE/DELETE/DDL)."""
-    with db_connect() as conn:
+    conn = db_connect()
+    try:
         with conn.cursor() as cur:
             cur.execute(sql, params)
         conn.commit()
+    finally:
+        conn.close()
 
 
 def db_one(sql, params=()):
-    """Fetch a single row as a dict, or None."""
-    with db_connect() as conn:
-        with conn.cursor() as cur:
+    conn = db_connect()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(sql, params)
             row = cur.fetchone()
-            if row is None:
-                return None
-            cols = [d[0] for d in cur.description]
-            return dict(zip(cols, row))
+            return dict(row) if row else None
+    finally:
+        conn.close()
 
 
 def db_all(sql, params=()):
-    """Fetch all rows as a list of dicts."""
-    with db_connect() as conn:
-        with conn.cursor() as cur:
+    conn = db_connect()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(sql, params)
-            rows = cur.fetchall()
-            cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, r)) for r in rows]
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
 
 
 def init_db():
@@ -103,17 +104,17 @@ def init_db():
     """)
     db_exec("""
     CREATE TABLE IF NOT EXISTS invoices (
-        id          SERIAL PRIMARY KEY,
-        user_id     INTEGER REFERENCES users(id) ON DELETE CASCADE,
-        file_id     TEXT,
-        file_name   TEXT,
-        category    TEXT,
-        category_ar TEXT,
-        confidence  INTEGER,
-        vendor      TEXT,
-        total       TEXT,
+        id           SERIAL PRIMARY KEY,
+        user_id      INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        file_id      TEXT,
+        file_name    TEXT,
+        category     TEXT,
+        category_ar  TEXT,
+        confidence   INTEGER,
+        vendor       TEXT,
+        total        TEXT,
         invoice_date TEXT,
-        summary     TEXT,
+        summary      TEXT,
         processed_at TIMESTAMP DEFAULT NOW()
     )
     """)
@@ -180,7 +181,6 @@ def auth_callback():
 
     userinfo = token.get("userinfo") or {}
     if not userinfo:
-        # Fallback: fetch userinfo manually
         resp = oauth.google.get("https://openidconnect.googleapis.com/v1/userinfo", token=token)
         userinfo = resp.json()
 
@@ -196,7 +196,6 @@ def auth_callback():
 
     existing = db_one("SELECT * FROM users WHERE google_id = %s", (google_id,))
     if existing:
-        # Keep existing refresh_token if Google didn't return a new one
         new_refresh = refresh_token or existing.get("refresh_token")
         db_exec(
             """UPDATE users
@@ -248,7 +247,6 @@ def api_invoices():
         "SELECT * FROM invoices WHERE user_id = %s ORDER BY processed_at DESC LIMIT 100",
         (user["id"],),
     )
-    # Stringify datetimes for JSON
     for r in rows:
         if isinstance(r.get("processed_at"), datetime.datetime):
             r["processed_at"] = r["processed_at"].isoformat()
@@ -380,9 +378,6 @@ def classify_with_claude(file_name, file_bytes, mime_type):
     return json.loads(raw)
 
 
-# ---------------------------------------------------------------------------
-# Templates fallback — render a simple page if templates are missing
-# ---------------------------------------------------------------------------
 @app.errorhandler(500)
 def on_500(e):
     return "Internal server error. Check Railway logs.", 500
