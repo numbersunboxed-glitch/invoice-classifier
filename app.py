@@ -7,6 +7,7 @@ import anthropic
 import openpyxl
 import io
 import sqlite3
+import ssl
 from pathlib import Path
 from functools import wraps
 
@@ -65,7 +66,7 @@ def get_db():
             host=p.hostname, port=p.port or 5432,
             database=p.path.lstrip("/"),
             user=p.username, password=p.password,
-            ssl_context=True,
+            ssl_context=ssl.SSLContext(),
         ), "pg8000"
     else:
         db_path = Path("invoices.db")
