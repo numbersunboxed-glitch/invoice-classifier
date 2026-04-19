@@ -7,5 +7,5 @@ google-auth-oauthlib==1.2.0
 google-api-python-client==2.134.0
 werkzeug==3.0.3
 gunicorn==22.0.0
-psycopg[binary]==3.2.3
+psycopg2-binary==2.9.10
 requests==2.32.3
