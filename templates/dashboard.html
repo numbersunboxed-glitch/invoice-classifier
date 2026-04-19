@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Invoice Classifier — Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,300&display=swap" rel="stylesheet">
+<link rel="manifest" href="/static/manifest.json">
+<meta name="theme-color" content="#0c0c0f">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Invoices">
+<link rel="apple-touch-icon" href="/static/icons/icon-192.png">
+<link rel="icon" type="image/png" href="/static/icons/icon-192.png">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0c0c0f;--surface:#141417;--surface2:#1a1a1e;
+  --border:rgba(255,255,255,0.07);--border2:rgba(255,255,255,0.12);
+  --text:#e2e2e2;--muted:#777;--hint:#444;
+  --accent:#7c6dfa;--accent2:#a89cf7;
+  --green:#3dd68c;--green-bg:rgba(61,214,140,.1);
+  --amber:#f0a832;--red:#f06060;
+  --r:8px;--rl:12px;
+}
+body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;font-size:14px}
+
+header{display:flex;align-items:center;justify-content:space-between;padding:14px 28px;border-bottom:0.5px solid var(--border);background:var(--surface)}
+.logo{font-family:'DM Mono',monospace;font-size:14px;font-weight:500;color:var(--muted)}
+.logo span{color:var(--accent2)}
+.user-info{display:flex;align-items:center;gap:10px}
+.avatar{width:28px;height:28px;border-radius:50%;object-fit:cover;border:0.5px solid var(--border2)}
+.avatar-fallback{width:28px;height:28px;border-radius:50%;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:500;color:#fff}
+.user-email{font-size:12px;color:var(--muted);font-family:'DM Mono',monospace}
+.logout{font-size:11px;color:var(--hint);text-decoration:none;padding:4px 8px;border:0.5px solid var(--border);border-radius:var(--r)}
+.logout:hover{color:var(--text);border-color:var(--border2)}
+
+main{max-width:900px;margin:1.5rem auto;padding:0 20px;display:grid;gap:14px}
+
+.card{background:var(--surface);border:0.5px solid var(--border);border-radius:var(--rl);padding:22px}
+.card-label{font-size:10px;font-weight:500;letter-spacing:.1em;text-transform:uppercase;color:var(--hint);margin-bottom:14px}
+
+/* Drive setup card */
+.setup-steps{display:grid;gap:10px}
+.setup-step{display:flex;align-items:center;gap:14px;padding:14px 16px;background:var(--surface2);border-radius:var(--r);border:0.5px solid var(--border)}
+.step-num{width:24px;height:24px;border-radius:50%;border:0.5px solid var(--border2);display:flex;align-items:center;justify-content:center;font-size:11px;font-family:'DM Mono',monospace;color:var(--muted);flex-shrink:0}
+.step-num.done{background:var(--green-bg);border-color:rgba(61,214,140,.3);color:var(--green)}
+.step-body{flex:1}
+.step-title{font-size:13px;font-weight:500;margin-bottom:2px}
+.step-sub{font-size:12px;color:var(--muted)}
+
+/* Folder picker */
+.folder-picker{display:none;margin-top:10px;gap:8px;flex-wrap:wrap}
+.folder-picker.show{display:flex}
+.folder-chip{font-size:12px;padding:5px 12px;border:0.5px solid var(--border2);border-radius:20px;background:transparent;color:var(--text);cursor:pointer;font-family:'DM Mono',monospace;transition:all .12s}
+.folder-chip:hover{background:var(--surface2);border-color:var(--accent)}
+.folder-chip.selected{background:rgba(124,109,250,.15);border-color:var(--accent);color:var(--accent2)}
+
+/* Webhook status banner */
+.webhook-banner{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;border-radius:var(--r);flex-wrap:wrap}
+.webhook-banner.active{background:var(--green-bg);border:0.5px solid rgba(61,214,140,.2)}
+.webhook-banner.inactive{background:rgba(240,168,50,.08);border:0.5px solid rgba(240,168,50,.2)}
+.wh-left{display:flex;align-items:center;gap:10px}
+.wh-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.wh-dot.on{background:var(--green);box-shadow:0 0 6px var(--green);animation:pulse 2s ease-in-out infinite}
+.wh-dot.off{background:var(--amber)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.wh-title{font-size:13px;font-weight:500}
+.wh-sub{font-size:12px;color:var(--muted);margin-top:2px}
+
+/* Buttons */
+.btn{font-size:12px;font-weight:500;padding:7px 14px;border-radius:var(--r);cursor:pointer;border:0.5px solid var(--border2);background:transparent;color:var(--text);transition:all .13s;font-family:'DM Sans',sans-serif;white-space:nowrap}
+.btn:hover{background:var(--surface2)}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn-accent{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn-accent:hover{background:#6a5de8;border-color:#6a5de8}
+.btn-sm{padding:5px 11px;font-size:11px}
+
+/* Upload */
+.upload-zone{border:1px dashed rgba(255,255,255,0.09);border-radius:var(--r);padding:28px 20px;text-align:center;cursor:pointer;transition:all .15s}
+.upload-zone:hover,.upload-zone.drag{border-color:var(--accent);background:rgba(124,109,250,.04)}
+.upload-icon{display:block;margin:0 auto 10px;opacity:.28;width:32px;height:32px}
+.upload-zone p{font-size:13px;color:var(--muted)}
+.upload-zone small{font-size:11px;color:var(--hint);display:block;margin-top:3px}
+.fname{font-size:11px;color:var(--accent2);font-family:'DM Mono',monospace;margin-top:7px;min-height:14px}
+.sep{display:flex;align-items:center;gap:10px;margin:12px 0}
+.sep::before,.sep::after{content:'';flex:1;height:0.5px;background:var(--border)}
+.sep span{font-size:11px;color:var(--hint)}
+textarea{width:100%;min-height:90px;font-size:13px;padding:11px;border:0.5px solid var(--border2);border-radius:var(--r);background:var(--surface2);color:var(--text);resize:vertical;font-family:'DM Sans',sans-serif;line-height:1.6}
+textarea:focus{outline:none;border-color:var(--accent)}
+textarea::placeholder{color:var(--hint)}
+.go-btn{width:100%;margin-top:10px;padding:10px;font-size:14px;font-weight:500}
+
+.loading{display:none;align-items:center;gap:10px;padding:12px 0;color:var(--muted);font-size:13px}
+.loading.show{display:flex}
+.spinner{width:14px;height:14px;border:1.5px solid var(--border2);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* Result */
+.result{display:none}
+.result.show{display:block}
+.result-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+.badge{display:inline-block;font-size:11px;font-weight:500;font-family:'DM Mono',monospace;padding:3px 11px;border-radius:20px}
+.food    {background:rgba(61,214,140,.1);color:#3dd68c;border:0.5px solid rgba(61,214,140,.2)}
+.tech    {background:rgba(124,109,250,.12);color:#a89cf7;border:0.5px solid rgba(124,109,250,.25)}
+.services{background:rgba(240,168,50,.1);color:#f0a832;border:0.5px solid rgba(240,168,50,.2)}
+.health  {background:rgba(240,96,96,.1);color:#f06060;border:0.5px solid rgba(240,96,96,.2)}
+.retail  {background:rgba(99,180,255,.1);color:#63b4ff;border:0.5px solid rgba(99,180,255,.2)}
+.other   {background:rgba(136,136,136,.1);color:#888;border:0.5px solid rgba(136,136,136,.2)}
+.conf-track{height:3px;background:var(--surface2);border-radius:99px;overflow:hidden;width:110px;margin-top:7px}
+.conf-fill{height:100%;background:var(--accent2);border-radius:99px;transition:width .6s}
+.conf-lbl{font-size:11px;color:var(--muted);margin-top:3px;font-family:'DM Mono',monospace}
+.metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-bottom:10px}
+.metric{background:var(--surface2);border-radius:var(--r);padding:11px 13px}
+.metric-lbl{font-size:10px;color:var(--hint);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}
+.metric-val{font-size:13px;font-weight:500;font-family:'DM Mono',monospace}
+.summary-box{font-size:13px;color:var(--muted);line-height:1.7;background:var(--surface2);border-radius:var(--r);padding:11px 13px}
+.err{background:rgba(240,96,96,.08);color:#f06060;font-size:12px;padding:9px 12px;border-radius:var(--r);margin-top:8px;display:none;border:0.5px solid rgba(240,96,96,.2)}
+.err.show{display:block}
+
+/* Stats + table */
+.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:14px}
+.stat{background:var(--surface2);border-radius:var(--r);padding:12px 14px}
+.stat-lbl{font-size:10px;color:var(--hint);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}
+.stat-val{font-size:20px;font-weight:300;font-family:'DM Mono',monospace}
+.feed-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.feed-header .card-label{margin-bottom:0}
+.tbl-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:12px;min-width:580px}
+th{text-align:left;font-weight:500;font-size:10px;color:var(--hint);text-transform:uppercase;letter-spacing:.06em;padding:0 10px 10px;border-bottom:0.5px solid var(--border)}
+td{padding:9px 10px;border-bottom:0.5px solid var(--border);color:var(--text);vertical-align:middle;font-family:'DM Mono',monospace;font-size:12px}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(255,255,255,.015)}
+.td-plain{font-family:'DM Sans',sans-serif;font-size:12px}
+.empty{text-align:center;color:var(--hint);font-size:12px;padding:28px;font-family:'DM Mono',monospace}
+
+@media(max-width:560px){.metrics,.stats{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">invoice<span>.</span>classifier</div>
+  <div class="user-info">
+    {% if user.picture %}
+      <img src="{{ user.picture }}" class="avatar" alt="">
+    {% else %}
+      <div class="avatar-fallback">{{ user.name[0]|upper if user.name else '?' }}</div>
+    {% endif %}
+    <span class="user-email">{{ user.email }}</span>
+    <a href="/logout" class="logout">Sign out</a>
+  </div>
+</header>
+
+<main>
+
+  <!-- Drive Setup -->
+  <div class="card">
+    <div class="card-label">Google Drive setup</div>
+
+    {% if webhook_ok %}
+    <div class="webhook-banner active" style="margin-bottom:14px">
+      <div class="wh-left">
+        <div class="wh-dot on"></div>
+        <div>
+          <div class="wh-title">Live — watching "{{ user.drive_folder_name or 'your folder' }}"</div>
+          <div class="wh-sub">Every invoice you add will be classified automatically</div>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px">
+        <button class="btn btn-sm" onclick="changeFolderUI()">Change folder</button>
+        <button class="btn btn-sm" onclick="reconnect()">Renew webhook</button>
+        <a href="/export" class="btn btn-sm" download>Export Excel ↓</a>
+      </div>
+    </div>
+    {% elif user.drive_folder_id %}
+    <div class="webhook-banner inactive" style="margin-bottom:14px">
+      <div class="wh-left">
+        <div class="wh-dot off"></div>
+        <div>
+          <div class="wh-title">Webhook expired for "{{ user.drive_folder_name or 'your folder' }}"</div>
+          <div class="wh-sub">Click Reconnect to resume automatic processing</div>
+        </div>
+      </div>
+      <button class="btn btn-accent btn-sm" onclick="reconnect()">Reconnect</button>
+    </div>
+    {% else %}
+    <div class="setup-steps" id="setupSteps">
+      <div class="setup-step">
+        <div class="step-num done">✓</div>
+        <div class="step-body">
+          <div class="step-title">Google account connected</div>
+          <div class="step-sub">{{ user.email }}</div>
+        </div>
+      </div>
+      <div class="setup-step">
+        <div class="step-num" id="step2num">2</div>
+        <div class="step-body">
+          <div class="step-title">Choose your invoices folder</div>
+          <div class="step-sub">Pick which Drive folder to watch for new invoices</div>
+          <div style="margin-top:10px">
+            <button class="btn btn-accent btn-sm" onclick="loadFolders()">Browse my folders</button>
+            <div class="folder-picker" id="folderPicker"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- Manual Upload -->
+  <div class="card">
+    <div class="card-label">Manual classify</div>
+    <div class="upload-zone" id="dropzone"
+      onclick="document.getElementById('fi').click()"
+      ondragover="event.preventDefault();this.classList.add('drag')"
+      ondragleave="this.classList.remove('drag')"
+      ondrop="onDrop(event)">
+      <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+        <polyline points="17 8 12 3 7 8"/>
+        <line x1="12" y1="3" x2="12" y2="15"/>
+      </svg>
+      <p>Drop file or click to select</p>
+      <small>PDF · JPG · PNG · Excel · CSV · TXT</small>
+      <p class="fname" id="fname"></p>
+    </div>
+    <input type="file" id="fi" style="display:none" accept=".pdf,.jpg,.jpeg,.png,.xlsx,.xls,.csv,.txt" onchange="onFileChange(this.files[0])">
+    <div class="sep"><span>or</span></div>
+    <textarea id="txt" placeholder="Paste invoice text here..."></textarea>
+    <button class="btn btn-accent go-btn" id="goBtn" onclick="classify()">Classify invoice</button>
+    <div class="err" id="errBox"></div>
+    <div class="loading" id="loading"><div class="spinner"></div><span>Analyzing with Claude...</span></div>
+  </div>
+
+  <!-- Result -->
+  <div class="card result" id="resultCard">
+    <div class="card-label">Result</div>
+    <div class="result-top">
+      <div>
+        <div style="font-size:10px;color:var(--hint);text-transform:uppercase;letter-spacing:.06em;margin-bottom:7px">Category</div>
+        <span class="badge" id="catBadge"></span>
+      </div>
+      <div>
+        <div style="font-size:10px;color:var(--hint);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Confidence</div>
+        <div class="conf-track"><div class="conf-fill" id="confFill" style="width:0"></div></div>
+        <div class="conf-lbl" id="confLbl"></div>
+      </div>
+    </div>
+    <div class="metrics">
+      <div class="metric"><div class="metric-lbl">Vendor</div><div class="metric-val" id="mVendor"></div></div>
+      <div class="metric"><div class="metric-lbl">Total</div><div class="metric-val" id="mTotal"></div></div>
+      <div class="metric"><div class="metric-lbl">Date</div><div class="metric-val" id="mDate"></div></div>
+    </div>
+    <div class="summary-box" id="mSummary"></div>
+  </div>
+
+  <!-- Invoice Log -->
+  <div class="card">
+    <div class="feed-header">
+      <div class="card-label">Invoice log</div>
+      <a href="/export" class="btn btn-sm" download>Export Excel ↓</a>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="stat-lbl">Total</div><div class="stat-val">{{ total }}</div></div>
+      <div class="stat"><div class="stat-lbl">This month</div><div class="stat-val">{{ month_count }}</div></div>
+      <div class="stat"><div class="stat-lbl">Top category</div><div class="stat-val" id="topCat">—</div></div>
+      <div class="stat"><div class="stat-lbl">Avg confidence</div><div class="stat-val" id="avgConf">—</div></div>
+    </div>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>Time</th><th>File</th><th>Category</th><th>Vendor</th><th>Total</th><th>Conf.</th><th>Source</th></tr></thead>
+        <tbody id="tbody">
+          {% for inv in invoices %}
+          <tr>
+            <td>{{ inv.processed_at.strftime('%d %b %H:%M') }}</td>
+            <td class="td-plain" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ inv.filename }}</td>
+            <td><span class="badge {{ inv.category }}">{{ category_map.get(inv.category, inv.category) }}</span></td>
+            <td class="td-plain">{{ inv.vendor or '—' }}</td>
+            <td>{{ inv.total or '—' }}</td>
+            <td>{{ inv.confidence }}%</td>
+            <td style="color:{{ '#3dd68c' if inv.source == 'drive' else '#555' }}">{{ '● drive' if inv.source == 'drive' else '↑ manual' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% if not invoices %}
+      <div class="empty">// no invoices yet — drop a file above or add one to your Drive folder</div>
+      {% endif %}
+    </div>
+  </div>
+
+</main>
+
+<script>
+const CAT_LABEL = {food:'food',tech:'tech',services:'services',health:'health',retail:'retail',other:'other'};
+let currentFile = null;
+let localHistory = [];
+
+{% for inv in invoices %}
+localHistory.push({category:'{{ inv.category }}', confidence: {{ inv.confidence }}});
+{% endfor %}
+updateStats();
+
+function onDrop(e){ e.preventDefault(); document.getElementById('dropzone').classList.remove('drag'); const f=e.dataTransfer.files[0]; if(f) setFile(f); }
+function onFileChange(f){ if(f) setFile(f); }
+function setFile(f){ currentFile=f; document.getElementById('fname').textContent=f.name; document.getElementById('txt').value=''; }
+function showErr(m){ const e=document.getElementById('errBox'); e.textContent=m; e.classList.add('show'); }
+function hideErr(){ document.getElementById('errBox').classList.remove('show'); }
+
+async function classify(){
+  hideErr();
+  const text = document.getElementById('txt').value.trim();
+  if(!currentFile && !text){ showErr('Upload a file or paste text first.'); return; }
+  const fd = new FormData();
+  if(currentFile) fd.append('file', currentFile); else fd.append('text', text);
+  document.getElementById('goBtn').disabled=true;
+  document.getElementById('loading').classList.add('show');
+  document.getElementById('resultCard').classList.remove('show');
+  try{
+    const r = await fetch('/classify',{method:'POST',body:fd});
+    const d = await r.json();
+    if(d.error){ showErr(d.error); return; }
+    renderResult(d);
+    prependRow(d);
+    localHistory.unshift({category:d.category,confidence:Math.round(d.confidence||0)});
+    updateStats();
+  } catch(e){ showErr('Error: '+e.message); }
+  finally{ document.getElementById('goBtn').disabled=false; document.getElementById('loading').classList.remove('show'); }
+}
+
+function renderResult(r){
+  const cat=r.category||'other';
+  const badge=document.getElementById('catBadge');
+  badge.textContent=CAT_LABEL[cat]||cat; badge.className='badge '+cat;
+  const conf=Math.round(r.confidence||0);
+  document.getElementById('confFill').style.width=conf+'%';
+  document.getElementById('confLbl').textContent=conf+'%';
+  document.getElementById('mVendor').textContent=r.vendor||'—';
+  document.getElementById('mTotal').textContent=r.total||'—';
+  document.getElementById('mDate').textContent=r.date||'—';
+  document.getElementById('mSummary').textContent=r.summary||'';
+  document.getElementById('resultCard').classList.add('show');
+}
+
+function prependRow(r){
+  const tbody=document.getElementById('tbody');
+  const tr=document.createElement('tr');
+  const now=new Date();
+  const t=now.toLocaleString('en-GB',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'});
+  tr.innerHTML=`
+    <td>${t}</td>
+    <td class="td-plain" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${r.filename||'—'}</td>
+    <td><span class="badge ${r.category||'other'}">${CAT_LABEL[r.category]||r.category||'other'}</span></td>
+    <td class="td-plain">${r.vendor||'—'}</td>
+    <td>${r.total||'—'}</td>
+    <td>${Math.round(r.confidence||0)}%</td>
+    <td style="color:#555">↑ manual</td>`;
+  tbody.insertBefore(tr, tbody.firstChild);
+  document.querySelector('.empty')?.remove();
+}
+
+function updateStats(){
+  const cc={};
+  localHistory.forEach(h=>cc[h.category]=(cc[h.category]||0)+1);
+  const top=Object.entries(cc).sort((a,b)=>b[1]-a[1])[0];
+  const avg=localHistory.length?Math.round(localHistory.reduce((s,h)=>s+h.confidence,0)/localHistory.length):null;
+  document.getElementById('topCat').textContent=top?(CAT_LABEL[top[0]]||top[0]):'—';
+  document.getElementById('avgConf').textContent=avg!==null?avg+'%':'—';
+}
+
+async function loadFolders(){
+  const btn=event.target; btn.disabled=true; btn.textContent='Loading...';
+  try{
+    const r=await fetch('/drive/folders');
+    const d=await r.json();
+    if(d.error){ alert(d.error); return; }
+    const picker=document.getElementById('folderPicker');
+    picker.innerHTML='';
+    d.folders.forEach(f=>{
+      const chip=document.createElement('button');
+      chip.className='folder-chip'; chip.textContent=f.name;
+      chip.onclick=()=>selectFolder(f.id, f.name);
+      picker.appendChild(chip);
+    });
+    picker.classList.add('show');
+  } catch(e){ alert('Failed to load folders'); }
+  finally{ btn.disabled=false; btn.textContent='Browse my folders'; }
+}
+
+async function selectFolder(id, name){
+  document.querySelectorAll('.folder-chip').forEach(c=>c.classList.remove('selected'));
+  event.target.classList.add('selected');
+  const r=await fetch('/drive/set-folder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({folder_id:id,folder_name:name})});
+  const d=await r.json();
+  if(d.ok) location.reload();
+  else alert('Error setting folder: '+(d.error||'unknown'));
+}
+
+async function reconnect(){
+  const btn=event.target; btn.disabled=true; btn.textContent='Reconnecting...';
+  try{
+    const r=await fetch('/drive/reconnect',{method:'POST'});
+    const d=await r.json();
+    if(d.ok) location.reload();
+    else alert('Error: '+(d.error||'unknown'));
+  } finally{ btn.disabled=false; btn.textContent='Reconnect'; }
+}
+
+function changeFolderUI(){
+  location.href='/dashboard';
+}
+
+// Poll every 10s for new Drive-classified invoices
+setInterval(async()=>{
+  try{
+    const r=await fetch('/invoices?page=1');
+    const d=await r.json();
+  } catch(e){}
+}, 10000);
+
+// PWA install prompt
+let deferredPrompt = null;
+window.addEventListener('beforeinstallprompt', e => {
+  e.preventDefault();
+  deferredPrompt = e;
+  showInstallBanner();
+});
+
+function showInstallBanner() {
+  const banner = document.getElementById('installBanner');
+  if (banner) banner.style.display = 'flex';
+}
+
+async function installPWA() {
+  if (!deferredPrompt) return;
+  deferredPrompt.prompt();
+  const { outcome } = await deferredPrompt.userChoice;
+  deferredPrompt = null;
+  document.getElementById('installBanner').style.display = 'none';
+}
+
+// Service worker registration
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/static/sw.js').then(reg => {
+    // Listen for sync messages
+    navigator.serviceWorker.addEventListener('message', e => {
+      if (e.data?.type === 'SYNC_READY') {
+        // retry any queued offline uploads here if needed
+      }
+    });
+  }).catch(() => {});
+}
+</script>
+
+<!-- PWA install banner (hidden until browser fires beforeinstallprompt) -->
+<div id="installBanner" style="display:none;position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:999;background:#141417;border:0.5px solid rgba(124,109,250,.4);border-radius:12px;padding:14px 18px;display:none;align-items:center;gap:14px;box-shadow:0 8px 32px rgba(0,0,0,.6);max-width:360px;width:calc(100% - 40px)">
+  <img src="/static/icons/icon-192.png" style="width:40px;height:40px;border-radius:8px;flex-shrink:0">
+  <div style="flex:1">
+    <div style="font-size:13px;font-weight:500;color:#e2e2e2">Add to home screen</div>
+    <div style="font-size:12px;color:#777;margin-top:2px">Install for faster access</div>
+  </div>
+  <button onclick="installPWA()" style="font-size:12px;font-weight:500;padding:7px 14px;border-radius:8px;background:#7c6dfa;border:none;color:#fff;cursor:pointer;font-family:'DM Sans',sans-serif;white-space:nowrap">Install</button>
+  <button onclick="this.parentElement.style.display='none'" style="background:none;border:none;color:#555;cursor:pointer;font-size:18px;line-height:1;padding:0 2px">×</button>
+</div>
+
+</body>
+</html>
