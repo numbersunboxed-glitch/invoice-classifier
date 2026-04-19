@@ -1,418 +1,401 @@
 import os
+import io
 import json
-import base64
 import uuid
+import base64
 import datetime
+from functools import wraps
+
+import psycopg
 import anthropic
 import openpyxl
-import io
-import ssl
-from pathlib import Path
-from functools import wraps
-from urllib.parse import urlparse
-
+import requests
 from flask import (
-    Flask, request, jsonify, render_template,
-    session, redirect, url_for, send_file
+    Flask, request, jsonify, render_template, session,
+    redirect, url_for, send_file, abort
 )
 from authlib.integrations.flask_client import OAuth
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
 
+# ---------------------------------------------------------------------------
+# App configuration
+# ---------------------------------------------------------------------------
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", "dev-secret-change-me")
 
-APP_URL        = os.environ.get("APP_URL", "http://localhost:5000")
-ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
-G_CLIENT_ID    = os.environ.get("GOOGLE_CLIENT_ID", "")
-G_CLIENT_SEC   = os.environ.get("GOOGLE_CLIENT_SECRET", "")
-DATABASE_URL   = os.environ.get("DATABASE_URL", "")
+DATABASE_URL     = os.environ.get("DATABASE_URL", "")
+ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_API_KEY", "")
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_SECRET    = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+APP_URL          = os.environ.get("APP_URL", "http://localhost:5000").rstrip("/")
 
-SCOPES = ["openid","email","profile","https://www.googleapis.com/auth/drive"]
+# Normalize postgres:// -> postgresql:// (Railway sometimes gives the old scheme)
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-oauth  = OAuth(app)
-google = oauth.register(
-    name="google",
-    client_id=G_CLIENT_ID,
-    client_secret=G_CLIENT_SEC,
-    server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
-    client_kwargs={"scope":" ".join(SCOPES),"access_type":"offline","prompt":"consent"},
-)
-
-CATEGORY_MAP = {
-    "food":"Food & Grocery","tech":"Technology","services":"Services",
-    "health":"Health & Medical","retail":"Retail","other":"Other",
+CATEGORIES = {
+    "food":     "غذاء",
+    "tech":     "تقنية",
+    "services": "خدمات",
+    "health":   "صحة",
+    "retail":   "تجزئة",
+    "other":    "أخرى",
 }
 
-# ── DB helpers ────────────────────────────────────────────────────────────────
-def _pg_conn():
-    import pg8000.native
-    url = DATABASE_URL.replace("postgres://","postgresql://",1)
-    p   = urlparse(url)
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.check_hostname = False
-    ctx.verify_mode    = ssl.CERT_NONE
-    return pg8000.native.Connection(
-        host=p.hostname, port=p.port or 5432,
-        database=p.path.lstrip("/"),
-        user=p.username, password=p.password,
-        ssl_context=ctx,
-    )
+anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_KEY) if ANTHROPIC_KEY else None
 
-def _use_pg():
-    return bool(DATABASE_URL and DATABASE_URL.startswith("postgres"))
+# ---------------------------------------------------------------------------
+# Database helpers (psycopg 3, uses %s placeholders)
+# ---------------------------------------------------------------------------
+def db_connect():
+    return psycopg.connect(DATABASE_URL, sslmode="require")
 
-def _con():
-    if _use_pg():
-        return _pg_conn(), "pg"
-    import sqlite3
-    c = __import__("sqlite3").connect("invoices.db")
-    c.row_factory = __import__("sqlite3").Row
-    return c, "sq"
 
-def _to_pg(sql):
-    """Convert ?-placeholders to :1,:2,... for pg8000."""
-    i = 0
-    out = []
-    for ch in sql:
-        if ch == "?":
-            i += 1
-            out.append(f":{i}")
-        else:
-            out.append(ch)
-    return "".join(out)
+def db_exec(sql, params=()):
+    """Execute a statement with no return (INSERT/UPDATE/DELETE/DDL)."""
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+        conn.commit()
 
-def db_run(sql, params=()):
-    conn, kind = _con()
-    try:
-        if kind == "pg":
-            conn.run(_to_pg(sql), *params)
-        else:
-            conn.execute(sql, params)
-            conn.commit()
-    finally:
-        conn.close()
 
 def db_one(sql, params=()):
-    conn, kind = _con()
-    try:
-        if kind == "pg":
-            rows = conn.run(_to_pg(sql), *params)
-            cols = [c["name"] for c in conn.columns]
-            return dict(zip(cols, rows[0])) if rows else None
-        else:
-            row = conn.execute(sql, params).fetchone()
-            return dict(row) if row else None
-    finally:
-        conn.close()
+    """Fetch a single row as a dict, or None."""
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            row = cur.fetchone()
+            if row is None:
+                return None
+            cols = [d[0] for d in cur.description]
+            return dict(zip(cols, row))
+
 
 def db_all(sql, params=()):
-    conn, kind = _con()
-    try:
-        if kind == "pg":
-            rows = conn.run(_to_pg(sql), *params)
-            cols = [c["name"] for c in conn.columns]
+    """Fetch all rows as a list of dicts."""
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
             return [dict(zip(cols, r)) for r in rows]
-        else:
-            return [dict(r) for r in conn.execute(sql, params).fetchall()]
-    finally:
-        conn.close()
 
-def db_count(sql, params=()):
-    conn, kind = _con()
-    try:
-        if kind == "pg":
-            rows = conn.run(_to_pg(sql), *params)
-            return rows[0][0] if rows else 0
-        else:
-            return conn.execute(sql, params).fetchone()[0]
-    finally:
-        conn.close()
 
 def init_db():
-    db_run("""CREATE TABLE IF NOT EXISTS users (
-        id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, name TEXT, picture TEXT,
-        google_id TEXT UNIQUE, access_token TEXT, refresh_token TEXT,
-        drive_folder_id TEXT, drive_folder_name TEXT,
-        webhook_channel_id TEXT, webhook_expiry TEXT, created_at TEXT)""")
-    db_run("""CREATE TABLE IF NOT EXISTS invoices (
-        id TEXT PRIMARY KEY, user_id TEXT NOT NULL, filename TEXT,
-        drive_file_id TEXT, category TEXT, vendor TEXT, total TEXT,
-        invoice_date TEXT, confidence INTEGER, summary TEXT,
-        source TEXT DEFAULT 'manual', processed_at TEXT)""")
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS users (
+        id              SERIAL PRIMARY KEY,
+        google_id       TEXT UNIQUE NOT NULL,
+        email           TEXT NOT NULL,
+        name            TEXT,
+        picture         TEXT,
+        access_token    TEXT,
+        refresh_token   TEXT,
+        token_expiry    TIMESTAMP,
+        folder_id       TEXT,
+        folder_name     TEXT,
+        channel_id      TEXT,
+        resource_id     TEXT,
+        channel_expiry  TIMESTAMP,
+        created_at      TIMESTAMP DEFAULT NOW()
+    )
+    """)
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS invoices (
+        id          SERIAL PRIMARY KEY,
+        user_id     INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        file_id     TEXT,
+        file_name   TEXT,
+        category    TEXT,
+        category_ar TEXT,
+        confidence  INTEGER,
+        vendor      TEXT,
+        total       TEXT,
+        invoice_date TEXT,
+        summary     TEXT,
+        processed_at TIMESTAMP DEFAULT NOW()
+    )
+    """)
 
-with app.app_context():
-    try:
-        init_db()
-    except Exception as e:
-        app.logger.error(f"DB init: {e}")
 
-# ── Auth ──────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# OAuth setup
+# ---------------------------------------------------------------------------
+oauth = OAuth(app)
+oauth.register(
+    name="google",
+    client_id=GOOGLE_CLIENT_ID,
+    client_secret=GOOGLE_SECRET,
+    server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+    client_kwargs={
+        "scope": (
+            "openid email profile "
+            "https://www.googleapis.com/auth/drive.readonly "
+            "https://www.googleapis.com/auth/drive.metadata.readonly"
+        ),
+        "prompt": "consent",
+    },
+)
+
+
 def login_required(f):
     @wraps(f)
-    def g(*a, **kw):
+    def wrapper(*args, **kwargs):
         if "user_id" not in session:
-            return redirect(url_for("login_page"))
-        return f(*a, **kw)
-    return g
+            return redirect(url_for("index"))
+        return f(*args, **kwargs)
+    return wrapper
+
 
 def current_user():
     uid = session.get("user_id")
-    return db_one("SELECT * FROM users WHERE id=?", (uid,)) if uid else None
-
-# ── Drive ─────────────────────────────────────────────────────────────────────
-def drive_svc(user):
-    if not user or not user.get("access_token"):
+    if not uid:
         return None
-    creds = Credentials(
-        token=user["access_token"], refresh_token=user.get("refresh_token"),
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=G_CLIENT_ID, client_secret=G_CLIENT_SEC,
-        scopes=["https://www.googleapis.com/auth/drive"],
-    )
-    return build("drive","v3",credentials=creds)
+    return db_one("SELECT * FROM users WHERE id = %s", (uid,))
 
-def register_webhook(user):
-    svc = drive_svc(user)
-    if not svc or not user.get("drive_folder_id"):
-        return False
-    cid    = str(uuid.uuid4())
-    expiry = datetime.datetime.utcnow() + datetime.timedelta(days=7)
-    try:
-        svc.files().watch(fileId=user["drive_folder_id"], body={
-            "id":cid,"type":"web_hook",
-            "address":f"{APP_URL.rstrip('/')}/webhook/{user['id']}",
-            "expiration":str(int(expiry.timestamp()*1000)),
-        }).execute()
-        db_run("UPDATE users SET webhook_channel_id=?,webhook_expiry=? WHERE id=?",
-               (cid, expiry.isoformat(), user["id"]))
-        return True
-    except Exception as e:
-        app.logger.error(f"webhook: {e}")
-        return False
 
-# ── Claude ────────────────────────────────────────────────────────────────────
-def run_claude(blocks):
-    blocks.append({"type":"text","text":"""Analyze this invoice. Respond ONLY with valid JSON (no markdown):
-{"category":"food|tech|services|health|retail|other","confidence":85,"vendor":"name or N/A","total":"amount+currency or N/A","date":"date or N/A","summary":"2-3 sentences"}"""})
-    msg = anthropic.Anthropic(api_key=ANTHROPIC_KEY).messages.create(
-        model="claude-sonnet-4-20250514", max_tokens=800,
-        messages=[{"role":"user","content":blocks}],
-    )
-    raw = "".join(b.text for b in msg.content if hasattr(b,"text"))
-    return json.loads(raw.replace("```json","").replace("```","").strip())
-
-def save_invoice(user_id, r, filename, drive_file_id=None, source="manual"):
-    iid = str(uuid.uuid4())
-    db_run(
-        "INSERT INTO invoices (id,user_id,filename,drive_file_id,category,vendor,total,invoice_date,confidence,summary,source,processed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (iid, user_id, filename, drive_file_id,
-         r.get("category","other"), r.get("vendor",""), r.get("total",""),
-         r.get("date",""), int(r.get("confidence",0)), r.get("summary",""),
-         source, datetime.datetime.utcnow().isoformat())
-    )
-    return iid
-
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Routes — auth
+# ---------------------------------------------------------------------------
 @app.route("/")
 def index():
-    return redirect(url_for("dashboard")) if session.get("user_id") else render_template("landing.html")
+    if "user_id" in session:
+        return redirect(url_for("dashboard"))
+    return render_template("index.html")
+
 
 @app.route("/login")
-def login_page():
-    return render_template("landing.html")
+def login():
+    redirect_uri = f"{APP_URL}/auth/callback"
+    return oauth.google.authorize_redirect(redirect_uri, access_type="offline")
 
-@app.route("/auth/google")
-def auth_google():
-    return google.authorize_redirect(url_for("auth_callback", _external=True))
 
 @app.route("/auth/callback")
 def auth_callback():
-    token    = google.authorize_access_token()
-    userinfo = token.get("userinfo") or google.userinfo()
-    existing = db_one("SELECT * FROM users WHERE google_id=?", (userinfo["sub"],))
-    if not existing:
-        uid = str(uuid.uuid4())
-        db_run(
-            "INSERT INTO users (id,email,name,picture,google_id,access_token,refresh_token,created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (uid, userinfo["email"], userinfo.get("name",""), userinfo.get("picture",""),
-             userinfo["sub"], token.get("access_token"), token.get("refresh_token"),
-             datetime.datetime.utcnow().isoformat())
+    try:
+        token = oauth.google.authorize_access_token()
+    except Exception as e:
+        return f"OAuth error: {e}", 400
+
+    userinfo = token.get("userinfo") or {}
+    if not userinfo:
+        # Fallback: fetch userinfo manually
+        resp = oauth.google.get("https://openidconnect.googleapis.com/v1/userinfo", token=token)
+        userinfo = resp.json()
+
+    google_id = userinfo.get("sub")
+    email     = userinfo.get("email", "")
+    name      = userinfo.get("name", "")
+    picture   = userinfo.get("picture", "")
+
+    access_token  = token.get("access_token")
+    refresh_token = token.get("refresh_token")
+    expires_in    = token.get("expires_in", 3600)
+    expiry = datetime.datetime.utcnow() + datetime.timedelta(seconds=int(expires_in))
+
+    existing = db_one("SELECT * FROM users WHERE google_id = %s", (google_id,))
+    if existing:
+        # Keep existing refresh_token if Google didn't return a new one
+        new_refresh = refresh_token or existing.get("refresh_token")
+        db_exec(
+            """UPDATE users
+               SET email=%s, name=%s, picture=%s,
+                   access_token=%s, refresh_token=%s, token_expiry=%s
+               WHERE google_id=%s""",
+            (email, name, picture, access_token, new_refresh, expiry, google_id),
         )
-        session["user_id"] = uid
+        user_id = existing["id"]
     else:
-        db_run("UPDATE users SET access_token=?,refresh_token=COALESCE(?,refresh_token) WHERE google_id=?",
-               (token.get("access_token"), token.get("refresh_token"), userinfo["sub"]))
-        session["user_id"] = existing["id"]
+        db_exec(
+            """INSERT INTO users
+               (google_id, email, name, picture, access_token, refresh_token, token_expiry)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+            (google_id, email, name, picture, access_token, refresh_token, expiry),
+        )
+        row = db_one("SELECT id FROM users WHERE google_id = %s", (google_id,))
+        user_id = row["id"]
+
+    session["user_id"] = user_id
     return redirect(url_for("dashboard"))
+
 
 @app.route("/logout")
 def logout():
     session.clear()
     return redirect(url_for("index"))
 
+
+# ---------------------------------------------------------------------------
+# Routes — dashboard & data
+# ---------------------------------------------------------------------------
 @app.route("/dashboard")
 @login_required
 def dashboard():
     user = current_user()
-    if not user:
-        return redirect(url_for("login_page"))
-    invoices    = db_all("SELECT * FROM invoices WHERE user_id=? ORDER BY processed_at DESC LIMIT 50", (user["id"],))
-    total       = db_count("SELECT COUNT(*) FROM invoices WHERE user_id=?", (user["id"],))
-    now         = datetime.datetime.utcnow()
-    month_start = datetime.datetime(now.year, now.month, 1).isoformat()
-    month_count = db_count("SELECT COUNT(*) FROM invoices WHERE user_id=? AND processed_at>=?", (user["id"], month_start))
-    webhook_ok  = bool(user.get("webhook_channel_id") and user.get("webhook_expiry") and
-                       user["webhook_expiry"] > datetime.datetime.utcnow().isoformat())
-    return render_template("dashboard.html", user=user, invoices=invoices,
-                           total=total, month_count=month_count,
-                           webhook_ok=webhook_ok, category_map=CATEGORY_MAP)
+    invoices = db_all(
+        "SELECT * FROM invoices WHERE user_id = %s ORDER BY processed_at DESC LIMIT 50",
+        (user["id"],),
+    )
+    return render_template("dashboard.html", user=user, invoices=invoices)
 
-@app.route("/drive/folders")
+
+@app.route("/api/invoices")
 @login_required
-def list_drive_folders():
-    svc = drive_svc(current_user())
-    if not svc:
-        return jsonify({"error":"Drive not connected"}), 400
+def api_invoices():
+    user = current_user()
+    rows = db_all(
+        "SELECT * FROM invoices WHERE user_id = %s ORDER BY processed_at DESC LIMIT 100",
+        (user["id"],),
+    )
+    # Stringify datetimes for JSON
+    for r in rows:
+        if isinstance(r.get("processed_at"), datetime.datetime):
+            r["processed_at"] = r["processed_at"].isoformat()
+    return jsonify(rows)
+
+
+@app.route("/api/folders")
+@login_required
+def api_folders():
+    user = current_user()
+    creds = user_credentials(user)
+    service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    results = service.files().list(
+        q="mimeType='application/vnd.google-apps.folder' and trashed=false",
+        pageSize=50,
+        fields="files(id, name)",
+    ).execute()
+    return jsonify(results.get("files", []))
+
+
+@app.route("/api/select-folder", methods=["POST"])
+@login_required
+def api_select_folder():
+    user = current_user()
+    data = request.get_json() or {}
+    folder_id   = data.get("folder_id")
+    folder_name = data.get("folder_name", "")
+    if not folder_id:
+        return jsonify({"error": "folder_id required"}), 400
+
+    db_exec(
+        "UPDATE users SET folder_id=%s, folder_name=%s WHERE id=%s",
+        (folder_id, folder_name, user["id"]),
+    )
+    return jsonify({"ok": True})
+
+
+@app.route("/api/export")
+@login_required
+def api_export():
+    user = current_user()
+    rows = db_all(
+        "SELECT * FROM invoices WHERE user_id = %s ORDER BY processed_at DESC",
+        (user["id"],),
+    )
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Invoices"
+    headers = ["التاريخ", "الملف", "الفئة", "المورد", "الإجمالي", "تاريخ الفاتورة", "الثقة %", "الملخص"]
+    ws.append(headers)
+    for r in rows:
+        ws.append([
+            (r.get("processed_at").strftime("%Y-%m-%d %H:%M") if r.get("processed_at") else ""),
+            r.get("file_name", ""),
+            r.get("category_ar", ""),
+            r.get("vendor", ""),
+            r.get("total", ""),
+            r.get("invoice_date", ""),
+            r.get("confidence", ""),
+            r.get("summary", ""),
+        ])
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return send_file(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name=f"invoices_{datetime.date.today()}.xlsx",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Google Drive helpers
+# ---------------------------------------------------------------------------
+def user_credentials(user):
+    return Credentials(
+        token=user["access_token"],
+        refresh_token=user["refresh_token"],
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_SECRET,
+        scopes=[
+            "https://www.googleapis.com/auth/drive.readonly",
+            "https://www.googleapis.com/auth/drive.metadata.readonly",
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Claude classification
+# ---------------------------------------------------------------------------
+def classify_with_claude(file_name, file_bytes, mime_type):
+    prompt = (
+        "Analyze this invoice and respond ONLY with valid JSON (no markdown), with keys:\n"
+        '{"category":"food|tech|services|health|retail|other",'
+        '"confidence":85,'
+        '"vendor":"name or غير محدد",'
+        '"total":"amount+currency or غير محدد",'
+        '"date":"date or غير محدد",'
+        '"summary":"2-3 sentences in Arabic"}'
+    )
+    b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
+
+    if mime_type == "application/pdf":
+        content = [
+            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": b64}},
+            {"type": "text", "text": prompt},
+        ]
+    elif mime_type and mime_type.startswith("image/"):
+        content = [
+            {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": b64}},
+            {"type": "text", "text": prompt},
+        ]
+    else:
+        try:
+            text = file_bytes.decode("utf-8", errors="ignore")[:10000]
+        except Exception:
+            text = ""
+        content = [{"type": "text", "text": f"{text}\n\n{prompt}"}]
+
+    msg = anthropic_client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=800,
+        messages=[{"role": "user", "content": content}],
+    )
+    raw = "".join(b.text for b in msg.content if hasattr(b, "text"))
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    return json.loads(raw)
+
+
+# ---------------------------------------------------------------------------
+# Templates fallback — render a simple page if templates are missing
+# ---------------------------------------------------------------------------
+@app.errorhandler(500)
+def on_500(e):
+    return "Internal server error. Check Railway logs.", 500
+
+
+# ---------------------------------------------------------------------------
+# Boot
+# ---------------------------------------------------------------------------
+with app.app_context():
     try:
-        res = svc.files().list(q="mimeType='application/vnd.google-apps.folder' and trashed=false",
-                               fields="files(id,name)", pageSize=50).execute()
-        return jsonify({"folders": res.get("files",[])})
+        init_db()
     except Exception as e:
-        return jsonify({"error":str(e)}), 500
+        print(f"[init_db] warning: {e}")
 
-@app.route("/drive/set-folder", methods=["POST"])
-@login_required
-def set_drive_folder():
-    user = current_user()
-    data = request.get_json()
-    fid  = data.get("folder_id")
-    if not fid:
-        return jsonify({"error":"folder_id required"}), 400
-    db_run("UPDATE users SET drive_folder_id=?,drive_folder_name=? WHERE id=?",
-           (fid, data.get("folder_name",""), user["id"]))
-    ok = register_webhook(db_one("SELECT * FROM users WHERE id=?", (user["id"],)))
-    return jsonify({"ok":ok,"folder_name":data.get("folder_name","")})
-
-@app.route("/drive/reconnect", methods=["POST"])
-@login_required
-def reconnect_webhook():
-    user = current_user()
-    if not user.get("drive_folder_id"):
-        return jsonify({"error":"No folder selected"}), 400
-    return jsonify({"ok": register_webhook(user)})
-
-@app.route("/webhook/<user_id>", methods=["POST"])
-def receive_webhook(user_id):
-    if request.headers.get("X-Goog-Resource-State","") in ("sync",""):
-        return "",200
-    user = db_one("SELECT * FROM users WHERE id=?", (user_id,))
-    if not user or not user.get("drive_folder_id"):
-        return "",200
-    try:
-        svc = drive_svc(user)
-        if not svc:
-            return "",200
-        done_ids = {r["drive_file_id"] for r in db_all(
-            "SELECT drive_file_id FROM invoices WHERE user_id=? AND drive_file_id IS NOT NULL",(user_id,))}
-        files = svc.files().list(
-            q=f"'{user['drive_folder_id']}' in parents and trashed=false",
-            fields="files(id,name,mimeType)", orderBy="createdTime desc", pageSize=20
-        ).execute().get("files",[])
-        for f in files:
-            if f["id"] in done_ids: continue
-            ext = f["name"].rsplit(".",1)[-1].lower() if "." in f["name"] else ""
-            if ext not in {"pdf","jpg","jpeg","png","xlsx","csv","txt"}: continue
-            try:
-                buf = io.BytesIO()
-                dl  = MediaIoBaseDownload(buf, svc.files().get_media(fileId=f["id"]))
-                done = False
-                while not done: _, done = dl.next_chunk()
-                buf.seek(0); raw = buf.read()
-                b64  = base64.standard_b64encode(raw).decode()
-                mime = f["mimeType"]
-                blks = []
-                if mime=="application/pdf":
-                    blks.append({"type":"document","source":{"type":"base64","media_type":"application/pdf","data":b64}})
-                elif mime.startswith("image/"):
-                    blks.append({"type":"image","source":{"type":"base64","media_type":mime,"data":b64}})
-                else:
-                    blks.append({"type":"text","text":raw.decode("utf-8",errors="ignore")})
-                save_invoice(user_id, run_claude(blks), f["name"], drive_file_id=f["id"], source="drive")
-            except Exception as e:
-                app.logger.error(f"file {f['name']}: {e}")
-    except Exception as e:
-        app.logger.error(f"webhook handler: {e}")
-    return "",200
-
-@app.route("/classify", methods=["POST"])
-@login_required
-def classify_manual():
-    user = current_user()
-    blocks=[]; filename="direct-text"
-    try:
-        if "file" in request.files and request.files["file"].filename:
-            from werkzeug.utils import secure_filename
-            f        = request.files["file"]
-            filename = secure_filename(f.filename)
-            raw      = f.read()
-            b64      = base64.standard_b64encode(raw).decode()
-            mime     = f.mimetype
-            if mime=="application/pdf":
-                blocks.append({"type":"document","source":{"type":"base64","media_type":"application/pdf","data":b64}})
-            elif mime.startswith("image/"):
-                blocks.append({"type":"image","source":{"type":"base64","media_type":mime,"data":b64}})
-            else:
-                blocks.append({"type":"text","text":raw.decode("utf-8",errors="ignore")})
-        else:
-            text = request.form.get("text","").strip()
-            if not text: return jsonify({"error":"Send a file or text"}),400
-            blocks.append({"type":"text","text":text})
-        result = run_claude(blocks)
-        iid    = save_invoice(user["id"], result, filename)
-        return jsonify({**result,"filename":filename,"id":iid})
-    except anthropic.AuthenticationError:
-        return jsonify({"error":"Invalid Anthropic API key"}),401
-    except Exception as e:
-        return jsonify({"error":str(e)}),500
-
-@app.route("/invoices")
-@login_required
-def get_invoices():
-    user = current_user()
-    page = int(request.args.get("page",1)); per=20
-    return jsonify({
-        "total":   db_count("SELECT COUNT(*) FROM invoices WHERE user_id=?",(user["id"],)),
-        "page":    page,
-        "invoices":db_all("SELECT * FROM invoices WHERE user_id=? ORDER BY processed_at DESC LIMIT ? OFFSET ?",
-                          (user["id"],per,(page-1)*per)),
-    })
-
-@app.route("/export")
-@login_required
-def export_excel():
-    user = current_user()
-    rows = db_all("SELECT * FROM invoices WHERE user_id=? ORDER BY processed_at DESC",(user["id"],))
-    wb=openpyxl.Workbook(); ws=wb.active; ws.title="Invoices"
-    hdr=["Processed At","File","Category","Vendor","Total","Invoice Date","Confidence %","Summary","Source"]
-    for c,h in enumerate(hdr,1):
-        cell=ws.cell(row=1,column=c,value=h)
-        cell.font=openpyxl.styles.Font(bold=True,color="FFFFFF")
-        cell.fill=openpyxl.styles.PatternFill("solid",fgColor="5046E4")
-    for inv in rows:
-        ws.append([inv.get("processed_at",""),inv.get("filename",""),
-                   CATEGORY_MAP.get(inv.get("category",""),inv.get("category","")),
-                   inv.get("vendor",""),inv.get("total",""),inv.get("invoice_date",""),
-                   inv.get("confidence",""),inv.get("summary",""),inv.get("source","")])
-    buf=io.BytesIO(); wb.save(buf); buf.seek(0)
-    return send_file(buf,as_attachment=True,
-                     download_name=f"invoices_{datetime.date.today()}.xlsx",
-                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-@app.route("/health")
-def health():
-    return jsonify({"status":"ok"})
-
-if __name__=="__main__":
-    app.run(host="0.0.0.0",port=int(os.environ.get("PORT",5000)),debug=False)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
