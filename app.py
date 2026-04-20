@@ -1,20 +1,9 @@
-import os
-import json
-import base64
-import uuid
-import datetime
-import anthropic
-import openpyxl
-import io
-import ssl
+import os, json, base64, uuid, datetime, anthropic, openpyxl, io, ssl
 from pathlib import Path
 from functools import wraps
 from urllib.parse import urlparse
 
-from flask import (
-    Flask, request, jsonify, render_template,
-    session, redirect, url_for, send_file
-)
+from flask import Flask, request, jsonify, render_template, session, redirect, url_for, send_file
 from authlib.integrations.flask_client import OAuth
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -23,110 +12,91 @@ from googleapiclient.http import MediaIoBaseDownload
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", "dev-secret-change-me")
 
-APP_URL        = os.environ.get("APP_URL", "http://localhost:5000")
-ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
-G_CLIENT_ID    = os.environ.get("GOOGLE_CLIENT_ID", "")
-G_CLIENT_SEC   = os.environ.get("GOOGLE_CLIENT_SECRET", "")
-DATABASE_URL   = os.environ.get("DATABASE_URL", "")
+APP_URL       = os.environ.get("APP_URL", "http://localhost:5000")
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+G_CLIENT_ID   = os.environ.get("GOOGLE_CLIENT_ID", "")
+G_CLIENT_SEC  = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+DATABASE_URL  = os.environ.get("DATABASE_URL", "")
 
 SCOPES = ["openid","email","profile","https://www.googleapis.com/auth/drive"]
-
 oauth  = OAuth(app)
 google = oauth.register(
-    name="google",
-    client_id=G_CLIENT_ID,
-    client_secret=G_CLIENT_SEC,
+    name="google", client_id=G_CLIENT_ID, client_secret=G_CLIENT_SEC,
     server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
     client_kwargs={"scope":" ".join(SCOPES),"access_type":"offline","prompt":"consent"},
 )
-
 CATEGORY_MAP = {
     "food":"Food & Grocery","tech":"Technology","services":"Services",
     "health":"Health & Medical","retail":"Retail","other":"Other",
 }
 
-# ── DB helpers ────────────────────────────────────────────────────────────────
+# ── DB ────────────────────────────────────────────────────────────────────────
+def _use_pg():
+    return bool(DATABASE_URL and DATABASE_URL.startswith("postgres"))
+
 def _pg_conn():
-    import pg8000.native
-    url = DATABASE_URL.replace("postgres://","postgresql://",1)
-    p   = urlparse(url)
+    import pg8000.dbapi
+    p = urlparse(DATABASE_URL.replace("postgres://","postgresql://",1))
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
-    ctx.verify_mode    = ssl.CERT_NONE
-    return pg8000.native.Connection(
+    ctx.verify_mode = ssl.CERT_NONE
+    return pg8000.dbapi.connect(
         host=p.hostname, port=p.port or 5432,
         database=p.path.lstrip("/"),
         user=p.username, password=p.password,
         ssl_context=ctx,
     )
 
-def _use_pg():
-    return bool(DATABASE_URL and DATABASE_URL.startswith("postgres"))
-
-def _con():
+def _get_conn():
     if _use_pg():
         return _pg_conn(), "pg"
     import sqlite3
-    c = __import__("sqlite3").connect("invoices.db")
-    c.row_factory = __import__("sqlite3").Row
+    c = sqlite3.connect("invoices.db")
+    c.row_factory = sqlite3.Row
     return c, "sq"
 
-def _to_pg(sql):
-    """Convert ?-placeholders to :1,:2,... for pg8000."""
-    i = 0
-    out = []
-    for ch in sql:
-        if ch == "?":
-            i += 1
-            out.append(f":{i}")
-        else:
-            out.append(ch)
-    return "".join(out)
+def _pg_sql(sql):
+    """Convert ?-placeholders to %s for pg8000 dbapi."""
+    return sql.replace("?", "%s")
 
 def db_run(sql, params=()):
-    conn, kind = _con()
+    conn, kind = _get_conn()
     try:
-        if kind == "pg":
-            conn.run(_to_pg(sql), *params)
-        else:
-            conn.execute(sql, params)
-            conn.commit()
+        cur = conn.cursor()
+        cur.execute(_pg_sql(sql) if kind=="pg" else sql, params)
+        conn.commit()
     finally:
         conn.close()
 
 def db_one(sql, params=()):
-    conn, kind = _con()
+    conn, kind = _get_conn()
     try:
-        if kind == "pg":
-            rows = conn.run(_to_pg(sql), *params)
-            cols = [c["name"] for c in conn.columns]
-            return dict(zip(cols, rows[0])) if rows else None
-        else:
-            row = conn.execute(sql, params).fetchone()
-            return dict(row) if row else None
+        cur = conn.cursor()
+        cur.execute(_pg_sql(sql) if kind=="pg" else sql, params)
+        row = cur.fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in cur.description]
+        return dict(zip(cols, row))
     finally:
         conn.close()
 
 def db_all(sql, params=()):
-    conn, kind = _con()
+    conn, kind = _get_conn()
     try:
-        if kind == "pg":
-            rows = conn.run(_to_pg(sql), *params)
-            cols = [c["name"] for c in conn.columns]
-            return [dict(zip(cols, r)) for r in rows]
-        else:
-            return [dict(r) for r in conn.execute(sql, params).fetchall()]
+        cur = conn.cursor()
+        cur.execute(_pg_sql(sql) if kind=="pg" else sql, params)
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
     finally:
         conn.close()
 
 def db_count(sql, params=()):
-    conn, kind = _con()
+    conn, kind = _get_conn()
     try:
-        if kind == "pg":
-            rows = conn.run(_to_pg(sql), *params)
-            return rows[0][0] if rows else 0
-        else:
-            return conn.execute(sql, params).fetchone()[0]
+        cur = conn.cursor()
+        cur.execute(_pg_sql(sql) if kind=="pg" else sql, params)
+        return cur.fetchone()[0]
     finally:
         conn.close()
 
@@ -171,7 +141,7 @@ def drive_svc(user):
         client_id=G_CLIENT_ID, client_secret=G_CLIENT_SEC,
         scopes=["https://www.googleapis.com/auth/drive"],
     )
-    return build("drive","v3",credentials=creds)
+    return build("drive", "v3", credentials=creds)
 
 def register_webhook(user):
     svc = drive_svc(user)
@@ -181,7 +151,7 @@ def register_webhook(user):
     expiry = datetime.datetime.utcnow() + datetime.timedelta(days=7)
     try:
         svc.files().watch(fileId=user["drive_folder_id"], body={
-            "id":cid,"type":"web_hook",
+            "id":cid, "type":"web_hook",
             "address":f"{APP_URL.rstrip('/')}/webhook/{user['id']}",
             "expiration":str(int(expiry.timestamp()*1000)),
         }).execute()
@@ -258,11 +228,11 @@ def dashboard():
     user = current_user()
     if not user:
         return redirect(url_for("login_page"))
-    invoices    = db_all("SELECT * FROM invoices WHERE user_id=? ORDER BY processed_at DESC LIMIT 50", (user["id"],))
-    total       = db_count("SELECT COUNT(*) FROM invoices WHERE user_id=?", (user["id"],))
+    invoices    = db_all("SELECT * FROM invoices WHERE user_id=? ORDER BY processed_at DESC LIMIT 50",(user["id"],))
+    total       = db_count("SELECT COUNT(*) FROM invoices WHERE user_id=?",(user["id"],))
     now         = datetime.datetime.utcnow()
     month_start = datetime.datetime(now.year, now.month, 1).isoformat()
-    month_count = db_count("SELECT COUNT(*) FROM invoices WHERE user_id=? AND processed_at>=?", (user["id"], month_start))
+    month_count = db_count("SELECT COUNT(*) FROM invoices WHERE user_id=? AND processed_at>=?",(user["id"],month_start))
     webhook_ok  = bool(user.get("webhook_channel_id") and user.get("webhook_expiry") and
                        user["webhook_expiry"] > datetime.datetime.utcnow().isoformat())
     return render_template("dashboard.html", user=user, invoices=invoices,
@@ -274,13 +244,13 @@ def dashboard():
 def list_drive_folders():
     svc = drive_svc(current_user())
     if not svc:
-        return jsonify({"error":"Drive not connected"}), 400
+        return jsonify({"error":"Drive not connected"}),400
     try:
         res = svc.files().list(q="mimeType='application/vnd.google-apps.folder' and trashed=false",
-                               fields="files(id,name)", pageSize=50).execute()
-        return jsonify({"folders": res.get("files",[])})
+                               fields="files(id,name)",pageSize=50).execute()
+        return jsonify({"folders":res.get("files",[])})
     except Exception as e:
-        return jsonify({"error":str(e)}), 500
+        return jsonify({"error":str(e)}),500
 
 @app.route("/drive/set-folder", methods=["POST"])
 @login_required
@@ -289,10 +259,10 @@ def set_drive_folder():
     data = request.get_json()
     fid  = data.get("folder_id")
     if not fid:
-        return jsonify({"error":"folder_id required"}), 400
+        return jsonify({"error":"folder_id required"}),400
     db_run("UPDATE users SET drive_folder_id=?,drive_folder_name=? WHERE id=?",
-           (fid, data.get("folder_name",""), user["id"]))
-    ok = register_webhook(db_one("SELECT * FROM users WHERE id=?", (user["id"],)))
+           (fid,data.get("folder_name",""),user["id"]))
+    ok = register_webhook(db_one("SELECT * FROM users WHERE id=?",(user["id"],)))
     return jsonify({"ok":ok,"folder_name":data.get("folder_name","")})
 
 @app.route("/drive/reconnect", methods=["POST"])
@@ -300,25 +270,24 @@ def set_drive_folder():
 def reconnect_webhook():
     user = current_user()
     if not user.get("drive_folder_id"):
-        return jsonify({"error":"No folder selected"}), 400
-    return jsonify({"ok": register_webhook(user)})
+        return jsonify({"error":"No folder selected"}),400
+    return jsonify({"ok":register_webhook(user)})
 
 @app.route("/webhook/<user_id>", methods=["POST"])
 def receive_webhook(user_id):
     if request.headers.get("X-Goog-Resource-State","") in ("sync",""):
         return "",200
-    user = db_one("SELECT * FROM users WHERE id=?", (user_id,))
+    user = db_one("SELECT * FROM users WHERE id=?",(user_id,))
     if not user or not user.get("drive_folder_id"):
         return "",200
     try:
         svc = drive_svc(user)
-        if not svc:
-            return "",200
+        if not svc: return "",200
         done_ids = {r["drive_file_id"] for r in db_all(
             "SELECT drive_file_id FROM invoices WHERE user_id=? AND drive_file_id IS NOT NULL",(user_id,))}
         files = svc.files().list(
             q=f"'{user['drive_folder_id']}' in parents and trashed=false",
-            fields="files(id,name,mimeType)", orderBy="createdTime desc", pageSize=20
+            fields="files(id,name,mimeType)",orderBy="createdTime desc",pageSize=20
         ).execute().get("files",[])
         for f in files:
             if f["id"] in done_ids: continue
@@ -326,39 +295,34 @@ def receive_webhook(user_id):
             if ext not in {"pdf","jpg","jpeg","png","xlsx","csv","txt"}: continue
             try:
                 buf = io.BytesIO()
-                dl  = MediaIoBaseDownload(buf, svc.files().get_media(fileId=f["id"]))
-                done = False
-                while not done: _, done = dl.next_chunk()
-                buf.seek(0); raw = buf.read()
-                b64  = base64.standard_b64encode(raw).decode()
-                mime = f["mimeType"]
-                blks = []
+                dl  = MediaIoBaseDownload(buf,svc.files().get_media(fileId=f["id"]))
+                done=False
+                while not done: _,done=dl.next_chunk()
+                buf.seek(0); raw=buf.read()
+                b64=base64.standard_b64encode(raw).decode()
+                mime=f["mimeType"]; blks=[]
                 if mime=="application/pdf":
                     blks.append({"type":"document","source":{"type":"base64","media_type":"application/pdf","data":b64}})
                 elif mime.startswith("image/"):
                     blks.append({"type":"image","source":{"type":"base64","media_type":mime,"data":b64}})
                 else:
                     blks.append({"type":"text","text":raw.decode("utf-8",errors="ignore")})
-                save_invoice(user_id, run_claude(blks), f["name"], drive_file_id=f["id"], source="drive")
+                save_invoice(user_id,run_claude(blks),f["name"],drive_file_id=f["id"],source="drive")
             except Exception as e:
                 app.logger.error(f"file {f['name']}: {e}")
     except Exception as e:
-        app.logger.error(f"webhook handler: {e}")
+        app.logger.error(f"webhook: {e}")
     return "",200
 
 @app.route("/classify", methods=["POST"])
 @login_required
 def classify_manual():
-    user = current_user()
-    blocks=[]; filename="direct-text"
+    user=current_user(); blocks=[]; filename="direct-text"
     try:
         if "file" in request.files and request.files["file"].filename:
             from werkzeug.utils import secure_filename
-            f        = request.files["file"]
-            filename = secure_filename(f.filename)
-            raw      = f.read()
-            b64      = base64.standard_b64encode(raw).decode()
-            mime     = f.mimetype
+            f=request.files["file"]; filename=secure_filename(f.filename)
+            raw=f.read(); b64=base64.standard_b64encode(raw).decode(); mime=f.mimetype
             if mime=="application/pdf":
                 blocks.append({"type":"document","source":{"type":"base64","media_type":"application/pdf","data":b64}})
             elif mime.startswith("image/"):
@@ -366,11 +330,11 @@ def classify_manual():
             else:
                 blocks.append({"type":"text","text":raw.decode("utf-8",errors="ignore")})
         else:
-            text = request.form.get("text","").strip()
+            text=request.form.get("text","").strip()
             if not text: return jsonify({"error":"Send a file or text"}),400
             blocks.append({"type":"text","text":text})
-        result = run_claude(blocks)
-        iid    = save_invoice(user["id"], result, filename)
+        result=run_claude(blocks)
+        iid=save_invoice(user["id"],result,filename)
         return jsonify({**result,"filename":filename,"id":iid})
     except anthropic.AuthenticationError:
         return jsonify({"error":"Invalid Anthropic API key"}),401
@@ -380,11 +344,10 @@ def classify_manual():
 @app.route("/invoices")
 @login_required
 def get_invoices():
-    user = current_user()
-    page = int(request.args.get("page",1)); per=20
+    user=current_user(); page=int(request.args.get("page",1)); per=20
     return jsonify({
-        "total":   db_count("SELECT COUNT(*) FROM invoices WHERE user_id=?",(user["id"],)),
-        "page":    page,
+        "total":db_count("SELECT COUNT(*) FROM invoices WHERE user_id=?",(user["id"],)),
+        "page":page,
         "invoices":db_all("SELECT * FROM invoices WHERE user_id=? ORDER BY processed_at DESC LIMIT ? OFFSET ?",
                           (user["id"],per,(page-1)*per)),
     })
@@ -392,8 +355,8 @@ def get_invoices():
 @app.route("/export")
 @login_required
 def export_excel():
-    user = current_user()
-    rows = db_all("SELECT * FROM invoices WHERE user_id=? ORDER BY processed_at DESC",(user["id"],))
+    user=current_user()
+    rows=db_all("SELECT * FROM invoices WHERE user_id=? ORDER BY processed_at DESC",(user["id"],))
     wb=openpyxl.Workbook(); ws=wb.active; ws.title="Invoices"
     hdr=["Processed At","File","Category","Vendor","Total","Invoice Date","Confidence %","Summary","Source"]
     for c,h in enumerate(hdr,1):
