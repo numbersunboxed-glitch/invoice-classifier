@@ -274,7 +274,7 @@ tr:hover td{background:rgba(255,255,255,.015)}
         <tbody id="tbody">
           {% for inv in invoices %}
           <tr>
-            <td>{{ inv.processed_at.strftime('%d %b %H:%M') }}</td>
+           <td>{{ inv.processed_at[:16] if inv.processed_at else '—' }}</td>
             <td class="td-plain" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ inv.filename }}</td>
             <td><span class="badge {{ inv.category }}">{{ category_map.get(inv.category, inv.category) }}</span></td>
             <td class="td-plain">{{ inv.vendor or '—' }}</td>
